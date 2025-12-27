@@ -1,4 +1,4 @@
-"const { makeWASocket, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { makeWASocket, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -25,8 +25,9 @@ let connectedUser = null;
 let mongoClient = null;
 let db = null;
 let isInitializing = false;
+let retryCount = 0;
+const MAX_RETRIES = 5;
 
-// MongoDB Auth State Management
 async function useMongoDBAuthState(collectionName = 'whatsapp_auth') {
     const collection = db.collection(collectionName);
     
@@ -62,13 +63,12 @@ async function useMongoDBAuthState(collectionName = 'whatsapp_auth') {
         }
     };
     
-    // Load existing creds
-    const creds = await readData('creds') || undefined;
+    const creds = await readData('creds');
     
     return {
         state: {
-            creds: creds,
-            keys: makeCacheableSignalKeyStore({
+            creds: creds || {},
+            keys: {
                 get: async (type, ids) => {
                     const data = {};
                     for (const id of ids) {
@@ -92,12 +92,10 @@ async function useMongoDBAuthState(collectionName = 'whatsapp_auth') {
                         }
                     }
                 }
-            }, logger)
-        },
-        saveCreds: async () => {
-            if (sock && sock.authState && sock.authState.creds) {
-                await writeData('creds', sock.authState.creds);
             }
+        },
+        saveCreds: async (newCreds) => {
+            await writeData('creds', newCreds || creds);
         }
     };
 }
@@ -105,15 +103,15 @@ async function useMongoDBAuthState(collectionName = 'whatsapp_auth') {
 async function connectMongo() {
     try {
         if (mongoClient) {
-            await mongoClient.close();
+            try { await mongoClient.close(); } catch(e) {}
         }
         mongoClient = new MongoClient(MONGO_URL);
         await mongoClient.connect();
         db = mongoClient.db(DB_NAME);
-        logger.info('✅ Connected to MongoDB');
+        logger.info('Connected to MongoDB');
         return true;
     } catch (error) {
-        logger.error('❌ MongoDB connection error:', error.message);
+        logger.error('MongoDB connection error:', error.message);
         return false;
     }
 }
@@ -124,16 +122,23 @@ async function initWhatsApp() {
         return;
     }
     
+    if (retryCount >= MAX_RETRIES) {
+        logger.error('Max retries reached. Waiting 30 seconds before next attempt.');
+        retryCount = 0;
+        setTimeout(initWhatsApp, 30000);
+        return;
+    }
+    
     isInitializing = true;
+    retryCount++;
     
     try {
-        // Ensure MongoDB is connected
         if (!db) {
             const connected = await connectMongo();
             if (!connected) {
-                logger.error('Cannot initialize WhatsApp without MongoDB');
                 connectionStatus = 'db_error';
                 isInitializing = false;
+                setTimeout(initWhatsApp, 5000);
                 return;
             }
         }
@@ -141,44 +146,33 @@ async function initWhatsApp() {
         const { state, saveCreds } = await useMongoDBAuthState('whatsapp_auth');
         const { version } = await fetchLatestBaileysVersion();
         
-        logger.info(`Using WA version: ${version.join('.')}`);
+        logger.info('Using WA version: ' + version.join('.'));
 
-        // Close existing socket
         if (sock) {
-            try {
-                sock.end();
-            } catch (e) {}
+            try { sock.end(); } catch (e) {}
             sock = null;
         }
 
         sock = makeWASocket({
-            auth: {
-                creds: state.creds || {},
-                keys: state.keys
-            },
+            auth: state,
             printQRInTerminal: false,
             browser: ['Elexart CRM', 'Chrome', '120.0.0'],
             logger: pino({ level: 'silent' }),
             version,
             connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 60000,
             getMessage: async () => ({ conversation: '' })
         });
-
-        // Store auth state reference
-        sock.authState = { creds: state.creds };
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             
-            logger.info(`Connection update: ${connection || 'qr'}`);
-
             if (qr) {
                 qrCode = qr;
                 try {
                     qrCodeBase64 = await QRCode.toDataURL(qr, { width: 300 });
                     connectionStatus = 'waiting_scan';
-                    logger.info('✅ QR Code generated - waiting for scan');
+                    retryCount = 0;
+                    logger.info('QR Code generated - waiting for scan');
                 } catch (err) {
                     logger.error('QR generation error:', err.message);
                 }
@@ -188,25 +182,24 @@ async function initWhatsApp() {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                 
-                logger.info(`Connection closed. Status: ${statusCode}, Reconnect: ${shouldReconnect}`);
+                logger.info('Connection closed. Status: ' + statusCode);
                 
                 connectionStatus = 'disconnected';
                 connectedUser = null;
                 isInitializing = false;
                 
                 if (shouldReconnect) {
-                    // Wait before reconnecting to avoid rapid loops
-                    logger.info('Reconnecting in 5 seconds...');
-                    setTimeout(initWhatsApp, 5000);
+                    const delay = Math.min(5000 * retryCount, 30000);
+                    logger.info('Reconnecting in ' + delay + 'ms...');
+                    setTimeout(initWhatsApp, delay);
                 } else {
-                    // Logged out - clear auth
-                    logger.info('Logged out - clearing auth data');
+                    logger.info('Logged out - clearing auth');
                     if (db) {
                         await db.collection('whatsapp_auth').deleteMany({});
                     }
                     qrCode = null;
                     qrCodeBase64 = null;
-                    // Restart to get new QR
+                    retryCount = 0;
                     setTimeout(initWhatsApp, 3000);
                 }
             }
@@ -216,6 +209,7 @@ async function initWhatsApp() {
                 qrCode = null;
                 qrCodeBase64 = null;
                 isInitializing = false;
+                retryCount = 0;
                 
                 const user = sock.user;
                 connectedUser = {
@@ -224,25 +218,22 @@ async function initWhatsApp() {
                     phone: user?.id?.split(':')[0] || user?.id?.split('@')[0]
                 };
                 
-                logger.info('✅ Connected as:', connectedUser.name);
+                logger.info('Connected as: ' + connectedUser.name);
                 
-                // Notify Elexart backend
                 try {
-                    await axios.post(`${FASTAPI_URL}/api/whatsapp-web/connected`, {
+                    await axios.post(FASTAPI_URL + '/api/whatsapp-web/connected', {
                         user: connectedUser
                     }, { timeout: 5000 });
                 } catch (e) {
-                    logger.warn('Could not notify backend:', e.message);
+                    logger.warn('Could not notify backend');
                 }
             }
         });
 
-        sock.ev.on('creds.update', async () => {
-            logger.info('Credentials updated, saving...');
-            await saveCreds();
+        sock.ev.on('creds.update', async (creds) => {
+            await saveCreds(creds);
         });
 
-        // Handle incoming messages
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type !== 'notify') return;
 
@@ -258,22 +249,19 @@ async function initWhatsApp() {
                                       message.message?.extendedTextMessage?.text ||
                                       message.message?.imageMessage?.caption ||
                                       '[Media]';
-                const messageId = message.key.id;
-                const timestamp = message.messageTimestamp;
 
-                logger.info(`📩 Message from ${pushName} (${phoneNumber}): ${messageContent}`);
+                logger.info('Message from ' + pushName + ': ' + messageContent);
 
-                // Send to Elexart backend
                 try {
-                    await axios.post(`${FASTAPI_URL}/api/whatsapp-web/webhook`, {
+                    await axios.post(FASTAPI_URL + '/api/whatsapp-web/webhook', {
                         from: phoneNumber,
                         name: pushName,
                         message: messageContent,
-                        messageId,
-                        timestamp
+                        messageId: message.key.id,
+                        timestamp: message.messageTimestamp
                     }, { timeout: 10000 });
                 } catch (error) {
-                    logger.error('Error sending to backend:', error.message);
+                    logger.error('Backend error:', error.message);
                 }
             }
         });
@@ -282,11 +270,11 @@ async function initWhatsApp() {
         logger.error('WhatsApp init error:', error.message);
         connectionStatus = 'error';
         isInitializing = false;
-        setTimeout(initWhatsApp, 10000);
+        const delay = Math.min(5000 * retryCount, 30000);
+        setTimeout(initWhatsApp, delay);
     }
 }
 
-// API Endpoints
 app.get('/status', (req, res) => {
     res.json({
         status: connectionStatus,
@@ -298,145 +286,73 @@ app.get('/status', (req, res) => {
 
 app.get('/qr', (req, res) => {
     if (connectionStatus === 'connected') {
-        return res.json({ 
-            status: 'connected', 
-            user: connectedUser,
-            message: 'Already connected'
-        });
+        return res.json({ status: 'connected', user: connectedUser });
     }
-    
-    res.json({
-        qr: qrCode,
-        qr_base64: qrCodeBase64,
-        status: connectionStatus
-    });
+    res.json({ qr: qrCode, qr_base64: qrCodeBase64, status: connectionStatus });
 });
 
 app.post('/send', async (req, res) => {
     const { phone_number, message } = req.body;
     
     if (!sock || connectionStatus !== 'connected') {
-        return res.status(503).json({ 
-            success: false, 
-            error: 'WhatsApp not connected' 
-        });
+        return res.status(503).json({ success: false, error: 'Not connected' });
     }
     
     try {
-        let jid = phone_number;
-        if (!jid.includes('@')) {
-            jid = jid.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
-        }
-        
+        let jid = phone_number.includes('@') ? phone_number : phone_number.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
         await sock.sendMessage(jid, { text: message });
-        
-        res.json({ 
-            success: true, 
-            message: 'Message sent',
-            to: jid
-        });
+        res.json({ success: true, to: jid });
     } catch (error) {
-        logger.error('Send error:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
 app.post('/logout', async (req, res) => {
     try {
-        if (sock) {
-            await sock.logout();
-        }
-        
-        // Clear MongoDB auth
-        if (db) {
-            await db.collection('whatsapp_auth').deleteMany({});
-        }
-        
+        if (sock) await sock.logout();
+        if (db) await db.collection('whatsapp_auth').deleteMany({});
         connectionStatus = 'disconnected';
         connectedUser = null;
         qrCode = null;
         qrCodeBase64 = null;
         isInitializing = false;
-        
-        // Reinitialize
+        retryCount = 0;
         setTimeout(initWhatsApp, 2000);
-        
-        res.json({ 
-            success: true, 
-            message: 'Logged out successfully' 
-        });
+        res.json({ success: true });
     } catch (error) {
-        logger.error('Logout error:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
 app.post('/reconnect', async (req, res) => {
-    try {
-        connectionStatus = 'reconnecting';
-        isInitializing = false;
-        
-        if (sock) {
-            try { sock.end(); } catch(e) {}
-            sock = null;
-        }
-        
-        setTimeout(initWhatsApp, 1000);
-        
-        res.json({ 
-            success: true, 
-            message: 'Reconnecting...' 
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
+    connectionStatus = 'reconnecting';
+    isInitializing = false;
+    retryCount = 0;
+    if (sock) { try { sock.end(); } catch(e) {} sock = null; }
+    setTimeout(initWhatsApp, 1000);
+    res.json({ success: true, message: 'Reconnecting...' });
 });
 
-// Health check for Render
 app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'healthy',
-        whatsapp: connectionStatus,
-        mongodb: db ? 'connected' : 'disconnected'
-    });
+    res.json({ status: 'healthy', whatsapp: connectionStatus, mongodb: db ? 'connected' : 'disconnected' });
 });
 
 app.get('/', (req, res) => {
-    res.json({ 
-        service: 'Elexart WhatsApp Service',
-        status: connectionStatus,
-        endpoints: ['/status', '/qr', '/send', '/logout', '/reconnect', '/health']
-    });
+    res.json({ service: 'Elexart WhatsApp Service', status: connectionStatus });
 });
 
-// Start server
 async function start() {
-    // Connect to MongoDB first
     const mongoConnected = await connectMongo();
-    
     if (!mongoConnected) {
-        logger.error('Failed to connect to MongoDB. Retrying in 5 seconds...');
+        logger.error('MongoDB failed. Retrying in 5 seconds...');
         setTimeout(start, 5000);
         return;
     }
     
-    // Start Express server
     app.listen(PORT, '0.0.0.0', () => {
-        logger.info(`🚀 WhatsApp service running on port ${PORT}`);
-        
-        // Initialize WhatsApp after short delay
+        logger.info('WhatsApp service running on port ' + PORT);
         setTimeout(initWhatsApp, 2000);
     });
 }
 
 start();
-"
