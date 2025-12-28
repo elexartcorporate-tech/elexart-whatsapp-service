@@ -934,3 +934,4 @@ async function start() {
 }
 
 start();
+Exit code: 0
