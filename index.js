@@ -31,6 +31,11 @@ let qrGeneratedAt = 0; // Track when QR was generated
 let qrAttempts = 0; // Track QR generation attempts
 let isConnecting = false; // Prevent multiple connection attempts
 
+// Store pending messages that couldn't be delivered to backend
+// This allows frontend to fetch and sync them manually
+let pendingMessages = [];
+const MAX_PENDING_MESSAGES = 100;
+
 // Ensure auth folder exists
 if (!fs.existsSync(AUTH_FOLDER)) {
     fs.mkdirSync(AUTH_FOLDER, { recursive: true });
@@ -318,19 +323,36 @@ async function initWhatsApp() {
 
                 logger.info('📩 Message from ' + pushName + ' (' + from + '): ' + messageContent);
 
+                const msgData = {
+                    id: message.key.id,
+                    phone_number: phoneNumber,
+                    push_name: pushName,
+                    message: messageContent,
+                    message_id: message.key.id,
+                    timestamp: message.messageTimestamp,
+                    original_jid: from,
+                    is_lid: isLid,
+                    received_at: Date.now()
+                };
+
+                // Try to forward to backend
+                let forwardedToBackend = false;
                 try {
-                    await axios.post(FASTAPI_URL + '/api/whatsapp-web/message', {
-                        phone_number: phoneNumber,
-                        push_name: pushName,
-                        message: messageContent,
-                        message_id: message.key.id,
-                        timestamp: message.messageTimestamp,
-                        original_jid: from,
-                        is_lid: isLid
-                    }, { timeout: 15000 });
+                    await axios.post(FASTAPI_URL + '/api/whatsapp-web/message', msgData, { timeout: 15000 });
                     logger.info('Message forwarded to backend');
+                    forwardedToBackend = true;
                 } catch (error) {
-                    logger.error('Backend error:', error.message);
+                    logger.error('Backend error (will store for sync):', error.message);
+                }
+
+                // If backend delivery failed, store in pending messages for frontend sync
+                if (!forwardedToBackend) {
+                    pendingMessages.push(msgData);
+                    // Keep only last N messages
+                    if (pendingMessages.length > MAX_PENDING_MESSAGES) {
+                        pendingMessages = pendingMessages.slice(-MAX_PENDING_MESSAGES);
+                    }
+                    logger.info('Message stored for frontend sync. Pending count: ' + pendingMessages.length);
                 }
             }
         });
@@ -860,8 +882,34 @@ app.get('/health', (req, res) => {
         status: 'healthy', 
         whatsapp: connectionStatus, 
         mongodb: db ? 'connected' : 'disconnected',
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        pending_messages: pendingMessages.length
     });
+});
+
+// Endpoint to get pending messages (for frontend sync when backend is unreachable)
+app.get('/pending-messages', (req, res) => {
+    res.json({
+        success: true,
+        count: pendingMessages.length,
+        messages: pendingMessages
+    });
+});
+
+// Endpoint to clear pending messages after they've been synced
+app.post('/clear-pending', (req, res) => {
+    const { message_ids } = req.body || {};
+    
+    if (message_ids && Array.isArray(message_ids) && message_ids.length > 0) {
+        // Clear specific messages
+        pendingMessages = pendingMessages.filter(m => !message_ids.includes(m.message_id));
+        res.json({ success: true, cleared: message_ids.length, remaining: pendingMessages.length });
+    } else {
+        // Clear all
+        const count = pendingMessages.length;
+        pendingMessages = [];
+        res.json({ success: true, cleared: count, remaining: 0 });
+    }
 });
 
 app.get('/', (req, res) => {
