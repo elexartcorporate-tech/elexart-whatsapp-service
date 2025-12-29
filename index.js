@@ -1,12 +1,9 @@
-const { makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const QRCode = require('qrcode');
 const pino = require('pino');
-const { MongoClient } = require('mongodb');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -16,420 +13,436 @@ const logger = pino({ level: 'info' });
 
 const FASTAPI_URL = process.env.FASTAPI_URL || 'http://localhost:8001';
 const PORT = process.env.PORT || 3002;
-const MONGO_URL = process.env.MONGO_URL || 'mongodb://localhost:27017';
-const DB_NAME = process.env.DB_NAME || 'elexart_whatsapp';
-const AUTH_FOLDER = './auth_info';
 
-var sock = null;
-var qrCode = null;
-var qrCodeBase64 = null;
-var connectionStatus = 'initializing';
-var connectedUser = null;
-var mongoClient = null;
-var db = null;
-var qrGeneratedAt = 0;
-var qrAttempts = 0;
-var isConnecting = false;
-var pendingMessages = [];
-var MAX_PENDING_MESSAGES = 100;
+let sock = null;
+let qrCode = null;
+let qrCodeBase64 = null;
+let connectionStatus = 'disconnected';
+let connectedUser = null;
 
-if (!fs.existsSync(AUTH_FOLDER)) {
-    fs.mkdirSync(AUTH_FOLDER, { recursive: true });
-}
+// Store untuk mapping LID ke nomor telepon asli
+const lidToPhoneMap = new Map();
+// Store contacts from messages
+const contactsStore = new Map();
 
-async function connectMongo() {
-    try {
-        mongoClient = new MongoClient(MONGO_URL);
-        await mongoClient.connect();
-        db = mongoClient.db(DB_NAME);
-        logger.info('Connected to MongoDB');
-        await restoreAuthFromMongo();
-        return true;
-    } catch (error) {
-        logger.error('MongoDB error: ' + error.message);
-        return false;
-    }
-}
-
-async function restoreAuthFromMongo() {
-    try {
-        var collection = db.collection('whatsapp_auth_files');
-        var files = await collection.find({}).toArray();
-        if (files.length > 0) {
-            logger.info('Restoring ' + files.length + ' auth files');
-            for (var i = 0; i < files.length; i++) {
-                var file = files[i];
-                var filePath = path.join(AUTH_FOLDER, file.filename);
-                fs.writeFileSync(filePath, file.content);
-            }
-        }
-    } catch (e) {
-        logger.error('Restore auth error: ' + e.message);
-    }
-}
-
-async function saveAuthToMongo() {
-    try {
-        if (!db || !fs.existsSync(AUTH_FOLDER)) return;
-        var collection = db.collection('whatsapp_auth_files');
-        var files = fs.readdirSync(AUTH_FOLDER);
-        for (var i = 0; i < files.length; i++) {
-            var filename = files[i];
-            var filePath = path.join(AUTH_FOLDER, filename);
-            var content = fs.readFileSync(filePath, 'utf8');
-            await collection.updateOne(
-                { filename: filename },
-                { $set: { filename: filename, content: content, updatedAt: new Date() } },
-                { upsert: true }
-            );
-        }
-        logger.info('Saved ' + files.length + ' auth files');
-    } catch (e) {
-        logger.error('Save auth error: ' + e.message);
-    }
-}
-
-async function clearAuth() {
-    try {
-        if (fs.existsSync(AUTH_FOLDER)) {
-            var files = fs.readdirSync(AUTH_FOLDER);
-            for (var i = 0; i < files.length; i++) {
-                fs.unlinkSync(path.join(AUTH_FOLDER, files[i]));
-            }
-        }
-        if (db) {
-            await db.collection('whatsapp_auth_files').deleteMany({});
-        }
-        logger.info('Auth cleared');
-    } catch (e) {
-        logger.error('Clear auth error: ' + e.message);
-    }
-}
 async function initWhatsApp() {
-    if (isConnecting) {
-        logger.info('Connection in progress, skipping');
-        return;
-    }
-    isConnecting = true;
     try {
-        connectionStatus = 'initializing';
-        qrAttempts = 0;
-        var authResult = await useMultiFileAuthState(AUTH_FOLDER);
-        var state = authResult.state;
-        var saveCreds = authResult.saveCreds;
-        var versionResult = await fetchLatestBaileysVersion();
-        var version = versionResult.version;
-        logger.info('Using WA version: ' + version.join('.'));
-        if (sock) {
-            try { sock.ev.removeAllListeners(); sock.end(); } catch (e) {}
-            sock = null;
-        }
+        const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+        const { version, isLatest } = await fetchLatestBaileysVersion();
+        
+        logger.info(`Using WA version: ${version.join('.')}, isLatest: ${isLatest}`);
+
         sock = makeWASocket({
             auth: state,
-            printQRInTerminal: false,
-            browser: ['Elexart CRM', 'Desktop', '4.0.0'],
+            printQRInTerminal: true,
+            browser: ['Elexart CRM', 'Chrome', '120.0.0'],
             logger: pino({ level: 'silent' }),
-            version: version,
-            connectTimeoutMs: 120000,
-            defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 25000,
-            qrTimeout: 120000,
-            retryRequestDelayMs: 500,
-            msgRetryCounterCache: new Map(),
-            getMessage: async function() { return undefined; },
-            syncFullHistory: false,
-            fireInitQueries: true,
-            generateHighQualityLinkPreview: false,
-            markOnlineOnConnect: true
+            version,
+            getMessage: async (key) => {
+                return { conversation: '' };
+            }
         });
-        sock.ev.on('connection.update', async function(update) {
-            var connection = update.connection;
-            var lastDisconnect = update.lastDisconnect;
-            var qr = update.qr;
-            var statusCode = null;
-            if (lastDisconnect && lastDisconnect.error && lastDisconnect.error.output) {
-                statusCode = lastDisconnect.error.output.statusCode;
-            }
-            logger.info('Connection update: ' + connection + ', hasQR: ' + !!qr);
+
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
+
             if (qr) {
-                qrAttempts++;
                 qrCode = qr;
-                qrGeneratedAt = Date.now();
+                // Generate base64 QR image
                 try {
-                    qrCodeBase64 = await QRCode.toDataURL(qr, { width: 512, margin: 3, errorCorrectionLevel: 'H' });
+                    qrCodeBase64 = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
                     connectionStatus = 'waiting_scan';
-                    logger.info('QR Code generated');
+                    logger.info('QR Code generated - waiting for scan');
                 } catch (err) {
-                    logger.error('QR error: ' + err.message);
+                    logger.error('QR generation error:', err);
                 }
             }
+
             if (connection === 'close') {
-                isConnecting = false;
+                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+                logger.info('Connection closed, reconnecting:', shouldReconnect);
                 connectionStatus = 'disconnected';
+                qrCode = null;
+                qrCodeBase64 = null;
                 connectedUser = null;
-                if (statusCode === DisconnectReason.loggedOut) {
-                    await clearAuth();
-                    qrCode = null;
-                    qrCodeBase64 = null;
-                    qrAttempts = 0;
+                
+                if (shouldReconnect) {
                     setTimeout(initWhatsApp, 5000);
-                } else if (statusCode === DisconnectReason.connectionReplaced) {
-                    connectionStatus = 'replaced';
-                } else if (statusCode === DisconnectReason.timedOut) {
-                    qrCode = null;
-                    qrCodeBase64 = null;
-                    setTimeout(initWhatsApp, 3000);
-                } else if (statusCode === 515) {
-                    setTimeout(initWhatsApp, 10000);
-                } else if (statusCode === DisconnectReason.multideviceMismatch) {
-                    await clearAuth();
-                    qrCode = null;
-                    qrCodeBase64 = null;
-                    setTimeout(initWhatsApp, 5000);
-                } else {
-                    var delay = qrAttempts > 3 ? 20000 : 8000;
-                    setTimeout(initWhatsApp, delay);
                 }
-            }
-            if (connection === 'open') {
-                isConnecting = false;
+            } else if (connection === 'open') {
                 connectionStatus = 'connected';
                 qrCode = null;
                 qrCodeBase64 = null;
-                qrAttempts = 0;
-                var user = sock.user;
-                connectedUser = {
-                    id: user ? user.id : null,
-                    name: user ? (user.name || user.verifiedName || 'WhatsApp User') : 'WhatsApp User',
-                    phone: user && user.id ? user.id.split(':')[0] : ''
-                };
-                logger.info('Connected as: ' + connectedUser.name);
-                await saveAuthToMongo();
+                
+                // Get connected user info
+                const user = sock.user;
+                connectedUser = user;
+                logger.info('WhatsApp connected successfully!');
+                
+                // Notify backend
                 try {
-                    await axios.post(FASTAPI_URL + '/api/whatsapp-web/connected', { user: connectedUser }, { timeout: 10000 });
-                } catch (e) {
-                    logger.warn('Backend notify failed: ' + e.message);
+                    await axios.post(`${FASTAPI_URL}/api/whatsapp-web/connected`, {
+                        phone: user?.id?.split(':')[0] || '',
+                        name: user?.name || 'WhatsApp User'
+                    });
+                } catch (err) {
+                    logger.error('Error notifying backend:', err.message);
                 }
             }
-            if (connection === 'connecting') {
-                connectionStatus = 'connecting';
-            }
         });
-        sock.ev.on('creds.update', async function() {
-            await saveCreds();
-            await saveAuthToMongo();
-        });
-        sock.ev.on('messages.upsert', async function(data) {
-            var messages = data.messages;
-            var type = data.type;
+
+        sock.ev.on('creds.update', saveCreds);
+
+        // Handle incoming messages
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type !== 'notify') return;
-            for (var i = 0; i < messages.length; i++) {
-                var message = messages[i];
-                if (message.key.fromMe) continue;
-                var from = message.key.remoteJid;
-                if (!from || from.indexOf('@g.us') !== -1 || from.indexOf('@broadcast') !== -1) continue;
-                var isLid = from.indexOf('@lid') !== -1;
-                var phoneNumber = from.replace('@s.whatsapp.net', '').replace('@lid', '');
-                var pushName = message.pushName || 'Unknown';
-                var messageContent = '[Media]';
+            
+            for (const message of messages) {
+                // Process ALL messages - both incoming AND outgoing (sent from phone)
                 if (message.message) {
-                    if (message.message.conversation) {
-                        messageContent = message.message.conversation;
-                    } else if (message.message.extendedTextMessage) {
-                        messageContent = message.message.extendedTextMessage.text || '[Media]';
-                    }
-                }
-                logger.info('Message from ' + pushName + ': ' + messageContent);
-                var msgData = {
-                    id: message.key.id,
-                    phone_number: phoneNumber,
-                    push_name: pushName,
-                    message: messageContent,
-                    message_id: message.key.id,
-                    timestamp: message.messageTimestamp,
-                    original_jid: from,
-                    is_lid: isLid,
-                    received_at: Date.now()
-                };
-                var forwarded = false;
-                try {
-                    await axios.post(FASTAPI_URL + '/api/whatsapp-web/message', msgData, { timeout: 15000 });
-                    forwarded = true;
-                } catch (error) {
-                    logger.error('Backend error: ' + error.message);
-                }
-                if (!forwarded) {
-                    pendingMessages.push(msgData);
-                    if (pendingMessages.length > MAX_PENDING_MESSAGES) {
-                        pendingMessages = pendingMessages.slice(-MAX_PENDING_MESSAGES);
-                    }
+                    const isFromMe = message.key.fromMe;
+                    await handleIncomingMessage(message, isFromMe);
                 }
             }
         });
+
+        // Listen for contacts update to map LID to phone
+        sock.ev.on('contacts.update', (contacts) => {
+            for (const contact of contacts) {
+                if (contact.id && contact.lid) {
+                    // Map LID to phone number
+                    const phone = contact.id.replace('@s.whatsapp.net', '');
+                    lidToPhoneMap.set(contact.lid.replace('@lid', ''), phone);
+                    logger.info(`Mapped LID ${contact.lid} to phone ${phone}`);
+                }
+            }
+        });
+
     } catch (error) {
-        logger.error('Init error: ' + error.message);
-        isConnecting = false;
+        logger.error('WhatsApp initialization error:', error);
         connectionStatus = 'error';
-        setTimeout(initWhatsApp, 15000);
+        setTimeout(initWhatsApp, 10000);
     }
 }
-app.get('/status', function(req, res) {
-    var now = Date.now();
-    var qrAge = qrGeneratedAt > 0 ? Math.round((now - qrGeneratedAt) / 1000) : 0;
-    res.json({
-        status: connectionStatus,
-        connected: connectionStatus === 'connected',
-        user: connectedUser,
-        mongodb: db ? 'connected' : 'disconnected',
-        qr_attempts: qrAttempts,
-        qr_age_seconds: qrAge,
-        qr_valid: qrAge < 120
+
+async function handleIncomingMessage(message, isFromMe = false) {
+    try {
+        const remoteJid = message.key.remoteJid;
+        const isGroup = remoteJid.endsWith('@g.us');
+        const isLid = remoteJid.endsWith('@lid');
+        
+        let phoneNumber = remoteJid
+            .replace('@s.whatsapp.net', '')
+            .replace('@g.us', '')
+            .replace('@lid', '');
+        
+        const pushName = message.pushName || '';
+        
+        // Try to resolve LID to actual phone number using various methods
+        if (isLid) {
+            // Method 1: Check our local map
+            const mappedPhone = lidToPhoneMap.get(phoneNumber);
+            if (mappedPhone) {
+                phoneNumber = mappedPhone;
+                logger.info(`Resolved LID from map: ${phoneNumber}`);
+            } else {
+                // Method 2: Try participant field
+                if (message.key.participant) {
+                    const participantPhone = message.key.participant.replace('@s.whatsapp.net', '').replace('@lid', '');
+                    if (participantPhone.length <= 15) {
+                        phoneNumber = participantPhone;
+                        lidToPhoneMap.set(remoteJid.replace('@lid', ''), phoneNumber);
+                        logger.info(`Got phone from participant: ${phoneNumber}`);
+                    }
+                }
+                
+                // Method 3: Try to get from message verifiedBizName
+                if (message.verifiedBizName) {
+                    const match = message.verifiedBizName.match(/\d{10,15}/);
+                    if (match) {
+                        phoneNumber = match[0];
+                        lidToPhoneMap.set(remoteJid.replace('@lid', ''), phoneNumber);
+                        logger.info(`Got phone from verifiedBizName: ${phoneNumber}`);
+                    }
+                }
+                
+                // Method 4: Try to fetch using onWhatsApp
+                if (phoneNumber.length > 15) {
+                    try {
+                        // For LID, we might need to query with the LID itself
+                        const results = await sock.fetchStatus(remoteJid);
+                        if (results && results.status) {
+                            logger.info(`Got status for ${remoteJid}: ${JSON.stringify(results)}`);
+                        }
+                    } catch (e) {
+                        // Ignore errors
+                    }
+                }
+            }
+        }
+        
+        // Clean the phone number
+        phoneNumber = phoneNumber.replace(/\D/g, '');
+        
+        // Convert 0 prefix to 62 (Indonesia)
+        if (phoneNumber.startsWith('0')) {
+            phoneNumber = '62' + phoneNumber.substring(1);
+        }
+        
+        const messageText = message.message?.conversation ||
+                           message.message?.extendedTextMessage?.text ||
+                           message.message?.imageMessage?.caption ||
+                           '';
+
+        // ========== CAPTURE REFERRAL/CONTEXT FROM CLICK-TO-WHATSAPP ADS ==========
+        // Check for context info (Click-to-WhatsApp ads, shared links, etc)
+        let referral = null;
+        let contextInfo = null;
+        let quotedMessage = null;
+        
+        // Get context from extendedTextMessage (most common for CTWA)
+        if (message.message?.extendedTextMessage?.contextInfo) {
+            contextInfo = message.message.extendedTextMessage.contextInfo;
+        }
+        // Or from other message types
+        if (!contextInfo && message.message?.imageMessage?.contextInfo) {
+            contextInfo = message.message.imageMessage.contextInfo;
+        }
+        if (!contextInfo && message.message?.videoMessage?.contextInfo) {
+            contextInfo = message.message.videoMessage.contextInfo;
+        }
+        
+        // Extract referral from context (Click-to-WhatsApp Ads)
+        if (contextInfo) {
+            // Check for external ad reply (CTWA - Click to WhatsApp Ads)
+            if (contextInfo.externalAdReply) {
+                const adReply = contextInfo.externalAdReply;
+                referral = {
+                    source_type: 'ctwa',  // Click-to-WhatsApp Ad
+                    title: adReply.title || '',
+                    body: adReply.body || '',
+                    thumbnail_url: adReply.thumbnailUrl || adReply.previewType || '',
+                    media_url: adReply.mediaUrl || '',
+                    source_url: adReply.sourceUrl || '',
+                    source_id: adReply.sourceId || '',
+                    containsAutoReply: adReply.containsAutoReply || false,
+                    renderLargerThumbnail: adReply.renderLargerThumbnail || false
+                };
+                logger.info(`📢 CTWA Ad detected! Title: ${referral.title}, URL: ${referral.source_url}`);
+            }
+            
+            // Check for forwarded info
+            if (contextInfo.isForwarded) {
+                if (!referral) referral = {};
+                referral.is_forwarded = true;
+                referral.forwarding_score = contextInfo.forwardingScore || 0;
+            }
+            
+            // Check for quoted message (reply to specific message)
+            if (contextInfo.quotedMessage) {
+                quotedMessage = {
+                    text: contextInfo.quotedMessage.conversation || 
+                          contextInfo.quotedMessage.extendedTextMessage?.text || '',
+                    stanza_id: contextInfo.stanzaId || '',
+                    participant: contextInfo.participant || ''
+                };
+            }
+        }
+        
+        // Also check message-level context
+        if (message.contextInfo) {
+            if (message.contextInfo.externalAdReply && !referral) {
+                const adReply = message.contextInfo.externalAdReply;
+                referral = {
+                    source_type: 'ctwa',
+                    title: adReply.title || '',
+                    body: adReply.body || '',
+                    thumbnail_url: adReply.thumbnailUrl || '',
+                    media_url: adReply.mediaUrl || '',
+                    source_url: adReply.sourceUrl || ''
+                };
+                logger.info(`📢 CTWA Ad (message level)! Title: ${referral.title}`);
+            }
+        }
+
+        // Handle media messages
+        let mediaType = null;
+        let mediaUrl = null;
+        
+        if (message.message?.imageMessage) {
+            mediaType = 'image';
+        } else if (message.message?.videoMessage) {
+            mediaType = 'video';
+        } else if (message.message?.audioMessage) {
+            mediaType = 'audio';
+        } else if (message.message?.documentMessage) {
+            mediaType = 'document';
+        } else if (message.message?.stickerMessage) {
+            mediaType = 'sticker';
+        }
+
+        // Skip if no text and no media
+        if (!messageText && !mediaType) return;
+
+        // For LID numbers that we couldn't resolve, use pushName as identifier hint
+        const displayPhone = phoneNumber.length > 15 ? `LID:${phoneNumber.substring(0,8)}...` : phoneNumber;
+        
+        const msgDirection = isFromMe ? 'OUTGOING (from phone)' : 'INCOMING';
+        logger.info(`${msgDirection} message ${isFromMe ? 'to' : 'from'} ${displayPhone} (jid: ${remoteJid}): ${messageText.substring(0, 50)}...`);
+        
+        // Log referral if exists
+        if (referral) {
+            logger.info(`📢 Referral data: ${JSON.stringify(referral)}`);
+        }
+
+        // Store contact for later use
+        contactsStore.set(remoteJid, {
+            id: remoteJid,
+            phone: phoneNumber,
+            name: pushName || phoneNumber,
+            jid: remoteJid,
+            isLid: isLid
+        });
+
+        // Forward to FastAPI backend - include all context data
+        try {
+            const response = await axios.post(`${FASTAPI_URL}/api/whatsapp-web/message`, {
+                phone_number: phoneNumber,
+                message: messageText || (mediaType ? `[${mediaType.toUpperCase()}]` : ''),
+                message_id: message.key.id,
+                timestamp: message.messageTimestamp,
+                is_group: isGroup,
+                push_name: pushName,
+                original_jid: remoteJid,
+                is_lid: isLid,
+                is_from_me: isFromMe,
+                media_type: mediaType,
+                // NEW: Referral/Ad context data
+                referral: referral,
+                quoted_message: quotedMessage,
+                is_forwarded: referral?.is_forwarded || false
+            });
+
+            // Send auto-reply if backend returns one (only for incoming messages)
+            if (!isFromMe && response.data?.reply) {
+                await sendMessage(remoteJid, response.data.reply);
+            }
+        } catch (err) {
+            logger.error('Error forwarding to backend:', err.message);
+        }
+
+    } catch (error) {
+        logger.error('Error handling incoming message:', error);
+    }
+}
+
+async function sendMessage(jid, text) {
+    try {
+        if (!sock || connectionStatus !== 'connected') {
+            throw new Error('WhatsApp not connected');
+        }
+
+        // Format JID if needed - handle both phone and LID
+        let formattedJid = jid;
+        if (!jid.includes('@')) {
+            // Try phone number first
+            formattedJid = `${jid}@s.whatsapp.net`;
+        }
+        
+        await sock.sendMessage(formattedJid, { text });
+        logger.info(`Message sent to ${formattedJid}`);
+        return { success: true };
+
+    } catch (error) {
+        logger.error('Error sending message:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+// REST API Endpoints
+
+// Get QR code for scanning
+app.get('/qr', async (req, res) => {
+    res.json({ 
+        qr: qrCode,
+        qr_base64: qrCodeBase64,
+        status: connectionStatus
     });
 });
 
-app.get('/qr', function(req, res) {
-    var accept = req.headers.accept || '';
-    if (accept.indexOf('application/json') !== -1) {
-        if (connectionStatus === 'connected') {
-            return res.json({ status: 'connected', qr: null, qr_base64: null, user: connectedUser });
-        }
-        return res.json({ qr: qrCode, qr_base64: qrCodeBase64, status: connectionStatus });
-    }
-    if (connectionStatus === 'connected') {
-        var userName = connectedUser ? connectedUser.name : 'User';
-        var userPhone = connectedUser ? connectedUser.phone : '';
-        res.send('<html><head><title>WhatsApp Connected</title><style>body{font-family:Arial;display:flex;justify-content:center;align-items:center;height:100vh;background:#25D366;margin:0}.box{background:white;padding:40px;border-radius:20px;text-align:center}h1{color:#25D366}a{display:inline-block;margin-top:20px;padding:10px 20px;background:#667eea;color:white;text-decoration:none;border-radius:10px}</style></head><body><div class="box"><h1>WhatsApp Connected!</h1><p>' + userName + '</p><p>+' + userPhone + '</p><a href="https://chat.tripgo.id/dashboard/channels">Back to Dashboard</a></div></body></html>');
-        return;
-    }
-    if (!qrCodeBase64 || connectionStatus === 'initializing' || connectionStatus === 'connecting') {
-        res.send('<html><head><title>Loading</title><meta http-equiv="refresh" content="2"><style>body{font-family:Arial;display:flex;justify-content:center;align-items:center;height:100vh;background:#667eea;margin:0}.box{background:white;padding:40px;border-radius:20px;text-align:center}.loader{border:5px solid #f3f3f3;border-top:5px solid #25D366;border-radius:50%;width:50px;height:50px;animation:spin 1s linear infinite;margin:0 auto 20px}@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style></head><body><div class="box"><div class="loader"></div><h2>Loading WhatsApp...</h2><p>Status: ' + connectionStatus + '</p></div></body></html>');
-        return;
-    }
-    var qrAge = Math.round((Date.now() - qrGeneratedAt) / 1000);
-    var timeLeft = Math.max(0, 120 - qrAge);
-    res.send('<html><head><title>Scan QR</title><style>body{font-family:Arial;display:flex;justify-content:center;align-items:center;height:100vh;background:#667eea;margin:0}.box{background:white;padding:30px;border-radius:20px;text-align:center;max-width:400px}img{max-width:300px;border-radius:10px}.timer{background:#333;color:white;padding:5px 15px;border-radius:20px;display:inline-block;margin-bottom:15px}.instructions{background:#e8f5e9;padding:15px;border-radius:10px;text-align:left;margin:15px 0}ol{margin:0;padding-left:20px}button{margin-top:15px;padding:10px 20px;background:#667eea;color:white;border:none;border-radius:10px;cursor:pointer}</style><script>var t=' + timeLeft + ';setInterval(function(){t--;var e=document.getElementById("t");if(e){e.textContent=t+"s";if(t<=0)e.textContent="Expired"}},1000);setInterval(function(){fetch("/status").then(function(r){return r.json()}).then(function(d){if(d.status==="connected")location.reload()})},3000)</script></head><body><div class="box"><h2>Scan QR Code</h2><div class="timer"><span id="t">' + timeLeft + 's</span></div><img src="' + qrCodeBase64 + '" /><div class="instructions"><strong>How to scan:</strong><ol><li>Open WhatsApp on your phone</li><li>Tap Menu then Linked Devices</li><li>Tap Link a Device</li><li>Point camera at QR code</li></ol></div><button onclick="location.href=\'/reconnect-page\'">Get New QR</button></div></body></html>');
+// Get connection status
+app.get('/status', (req, res) => {
+    res.json({
+        status: connectionStatus,
+        connected: connectionStatus === 'connected',
+        user: connectedUser ? {
+            id: connectedUser.id,
+            name: connectedUser.name
+        } : null
+    });
 });
 
-app.get('/reconnect-page', async function(req, res) {
-    qrCode = null;
-    qrCodeBase64 = null;
-    qrAttempts = 0;
-    if (sock) {
-        try { sock.ev.removeAllListeners(); sock.end(); } catch(e) {}
-        sock = null;
-    }
-    isConnecting = false;
-    connectionStatus = 'initializing';
-    setTimeout(initWhatsApp, 1000);
-    res.redirect('/qr');
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-app.get('/qr-image', function(req, res) {
-    res.redirect('/qr');
+// Send message endpoint
+app.post('/send', async (req, res) => {
+    const { phone_number, message } = req.body;
+    
+    if (!phone_number || !message) {
+        return res.status(400).json({ error: 'phone_number and message are required' });
+    }
+
+    const result = await sendMessage(phone_number, message);
+    res.json(result);
 });
 
-app.post('/send', async function(req, res) {
-    var phone = req.body.phone_number;
-    var msg = req.body.message;
-    if (!sock || connectionStatus !== 'connected') {
-        return res.status(503).json({ success: false, error: 'Not connected' });
-    }
-    try {
-        var jid;
-        if (phone.indexOf('@') !== -1) {
-            jid = phone;
-        } else if (phone.indexOf('WA:') === 0 || phone.length > 15) {
-            jid = phone.replace('WA:', '').replace(/[^0-9]/g, '') + '@lid';
-        } else {
-            jid = phone.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
-        }
-        await sock.sendMessage(jid, { text: msg });
-        res.json({ success: true, to: jid });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.post('/logout', async function(req, res) {
+// Logout endpoint
+app.post('/logout', async (req, res) => {
     try {
         if (sock) {
-            try { await sock.logout(); } catch(e) {}
+            await sock.logout();
         }
-        await clearAuth();
         connectionStatus = 'disconnected';
         connectedUser = null;
         qrCode = null;
         qrCodeBase64 = null;
-        qrAttempts = 0;
-        isConnecting = false;
-        setTimeout(initWhatsApp, 3000);
-        res.json({ success: true });
+        res.json({ success: true, message: 'Logged out successfully' });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ error: error.message });
     }
 });
 
-app.post('/reconnect', async function(req, res) {
-    connectionStatus = 'reconnecting';
-    qrCode = null;
-    qrCodeBase64 = null;
-    qrAttempts = 0;
-    if (sock) {
-        try { sock.ev.removeAllListeners(); sock.end(); } catch(e) {}
-        sock = null;
-    }
-    isConnecting = false;
-    setTimeout(initWhatsApp, 2000);
-    res.json({ success: true });
-});
-
-app.get('/health', function(req, res) {
-    res.json({
-        status: 'healthy',
-        whatsapp: connectionStatus,
-        mongodb: db ? 'connected' : 'disconnected',
-        pending_messages: pendingMessages.length
-    });
-});
-
-app.get('/pending-messages', function(req, res) {
-    res.json({
-        success: true,
-        count: pendingMessages.length,
-        messages: pendingMessages
-    });
-});
-
-app.post('/clear-pending', function(req, res) {
-    var ids = req.body && req.body.message_ids ? req.body.message_ids : null;
-    if (ids && Array.isArray(ids) && ids.length > 0) {
-        pendingMessages = pendingMessages.filter(function(m) {
-            return ids.indexOf(m.message_id) === -1;
-        });
-        res.json({ success: true, cleared: ids.length, remaining: pendingMessages.length });
-    } else {
-        var count = pendingMessages.length;
-        pendingMessages = [];
-        res.json({ success: true, cleared: count, remaining: 0 });
+// Reconnect endpoint
+app.post('/reconnect', async (req, res) => {
+    try {
+        if (sock) {
+            sock.end();
+        }
+        connectionStatus = 'reconnecting';
+        await initWhatsApp();
+        res.json({ success: true, message: 'Reconnecting...' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 
-app.get('/', function(req, res) {
-    res.json({
-        service: 'Elexart WhatsApp Service',
-        status: connectionStatus,
-        connected_user: connectedUser ? connectedUser.name : null,
-        qr_url: '/qr',
-        status_url: '/status'
-    });
+// Get contacts endpoint for broadcast
+app.get('/contacts', async (req, res) => {
+    try {
+        const contactList = Array.from(contactsStore.values());
+        res.json({ contacts: contactList });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
-async function start() {
-    await connectMongo();
-    app.listen(PORT, '0.0.0.0', function() {
-        logger.info('WhatsApp service running on port ' + PORT);
-        setTimeout(initWhatsApp, 2000);
-    });
-}
-
-start();
+// Start server
+app.listen(PORT, () => {
+    logger.info(`WhatsApp Web Service running on port ${PORT}`);
+    logger.info(`FastAPI backend URL: ${FASTAPI_URL}`);
+    initWhatsApp();
+});
+Exit code: 0
