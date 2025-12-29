@@ -20,8 +20,49 @@ let qrCodeBase64 = null;
 let connectionStatus = 'disconnected';
 let connectedUser = null;
 
+// Store untuk mapping LID ke nomor telepon asli
 const lidToPhoneMap = new Map();
+// Store contacts from messages
 const contactsStore = new Map();
+
+// ========== KEEP-ALIVE MECHANISM ==========
+let keepAliveInterval = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const BASE_RECONNECT_DELAY = 5000; // 5 seconds
+
+function startKeepAlive() {
+    // Clear any existing interval
+    if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+    }
+    
+    // Send presence update every 30 seconds to keep connection alive
+    keepAliveInterval = setInterval(async () => {
+        if (sock && connectionStatus === 'connected') {
+            try {
+                // Send presence update to keep session alive
+                await sock.sendPresenceUpdate('available');
+                logger.info('Keep-alive: Presence update sent');
+            } catch (err) {
+                logger.warn('Keep-alive: Failed to send presence update', err.message);
+            }
+        }
+    }, 30000); // Every 30 seconds
+}
+
+function stopKeepAlive() {
+    if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+    }
+}
+
+function getReconnectDelay() {
+    // Exponential backoff: 5s, 10s, 20s, 40s, ... up to max 5 minutes
+    const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts), 300000);
+    return delay;
+}
 
 async function initWhatsApp() {
     try {
@@ -36,6 +77,11 @@ async function initWhatsApp() {
             browser: ['Elexart CRM', 'Chrome', '120.0.0'],
             logger: pino({ level: 'silent' }),
             version,
+            // ========== STABILITY IMPROVEMENTS ==========
+            syncFullHistory: false, // Don't sync full history to reduce load
+            generateHighQualityLinkPreview: false, // Reduce processing
+            markOnlineOnConnect: true, // Mark online when connected
+            retryRequestDelayMs: 250, // Delay between retries
             getMessage: async (key) => {
                 return { conversation: '' };
             }
@@ -56,24 +102,43 @@ async function initWhatsApp() {
             }
 
             if (connection === 'close') {
-                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                logger.info('Connection closed, reconnecting:', shouldReconnect);
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                
+                logger.info(`Connection closed. Status: ${statusCode}, Reconnecting: ${shouldReconnect}`);
                 connectionStatus = 'disconnected';
                 qrCode = null;
                 qrCodeBase64 = null;
                 connectedUser = null;
                 
+                // Stop keep-alive when disconnected
+                stopKeepAlive();
+                
                 if (shouldReconnect) {
-                    setTimeout(initWhatsApp, 5000);
+                    reconnectAttempts++;
+                    
+                    if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+                        const delay = getReconnectDelay();
+                        logger.info(`Reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay/1000}s`);
+                        connectionStatus = 'reconnecting';
+                        setTimeout(initWhatsApp, delay);
+                    } else {
+                        logger.error('Max reconnect attempts reached. Manual intervention required.');
+                        connectionStatus = 'error';
+                    }
                 }
             } else if (connection === 'open') {
                 connectionStatus = 'connected';
                 qrCode = null;
                 qrCodeBase64 = null;
+                reconnectAttempts = 0; // Reset reconnect counter on successful connection
                 
                 const user = sock.user;
                 connectedUser = user;
                 logger.info('WhatsApp connected successfully!');
+                
+                // Start keep-alive mechanism
+                startKeepAlive();
                 
                 try {
                     await axios.post(`${FASTAPI_URL}/api/whatsapp-web/connected`, {
@@ -88,6 +153,7 @@ async function initWhatsApp() {
 
         sock.ev.on('creds.update', saveCreds);
 
+        // Handle ALL messages - incoming AND outgoing (sent from phone)
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type !== 'notify') return;
             
@@ -112,7 +178,14 @@ async function initWhatsApp() {
     } catch (error) {
         logger.error('WhatsApp initialization error:', error);
         connectionStatus = 'error';
-        setTimeout(initWhatsApp, 10000);
+        
+        // Retry with exponential backoff
+        reconnectAttempts++;
+        if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+            const delay = getReconnectDelay();
+            logger.info(`Init error. Retry ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay/1000}s`);
+            setTimeout(initWhatsApp, delay);
+        }
     }
 }
 
@@ -129,6 +202,7 @@ async function handleIncomingMessage(message, isFromMe = false) {
         
         const pushName = message.pushName || '';
         
+        // Try to resolve LID to actual phone number
         if (isLid) {
             const mappedPhone = lidToPhoneMap.get(phoneNumber);
             if (mappedPhone) {
@@ -152,6 +226,17 @@ async function handleIncomingMessage(message, isFromMe = false) {
                         logger.info(`Got phone from verifiedBizName: ${phoneNumber}`);
                     }
                 }
+                
+                if (phoneNumber.length > 15) {
+                    try {
+                        const results = await sock.fetchStatus(remoteJid);
+                        if (results && results.status) {
+                            logger.info(`Got status for ${remoteJid}: ${JSON.stringify(results)}`);
+                        }
+                    } catch (e) {
+                        // Ignore errors
+                    }
+                }
             }
         }
         
@@ -166,10 +251,12 @@ async function handleIncomingMessage(message, isFromMe = false) {
                            message.message?.imageMessage?.caption ||
                            '';
 
+        // ========== CAPTURE CLICK-TO-WHATSAPP ADS (CTWA) ==========
         let referral = null;
         let contextInfo = null;
         let quotedMessage = null;
         
+        // Get context from extendedTextMessage (most common for CTWA)
         if (message.message?.extendedTextMessage?.contextInfo) {
             contextInfo = message.message.extendedTextMessage.contextInfo;
         }
@@ -180,6 +267,7 @@ async function handleIncomingMessage(message, isFromMe = false) {
             contextInfo = message.message.videoMessage.contextInfo;
         }
         
+        // Extract referral from context (Click-to-WhatsApp Ads)
         if (contextInfo) {
             if (contextInfo.externalAdReply) {
                 const adReply = contextInfo.externalAdReply;
@@ -213,6 +301,7 @@ async function handleIncomingMessage(message, isFromMe = false) {
             }
         }
         
+        // Also check message-level context
         if (message.contextInfo) {
             if (message.contextInfo.externalAdReply && !referral) {
                 const adReply = message.contextInfo.externalAdReply;
@@ -228,6 +317,7 @@ async function handleIncomingMessage(message, isFromMe = false) {
             }
         }
 
+        // Handle media messages
         let mediaType = null;
         
         if (message.message?.imageMessage) {
@@ -261,6 +351,7 @@ async function handleIncomingMessage(message, isFromMe = false) {
             isLid: isLid
         });
 
+        // Forward to FastAPI backend with all context data
         try {
             const response = await axios.post(`${FASTAPI_URL}/api/whatsapp-web/message`, {
                 phone_number: phoneNumber,
@@ -311,11 +402,13 @@ async function sendMessage(jid, text) {
     }
 }
 
+// REST API Endpoints
 app.get('/qr', async (req, res) => {
     res.json({ 
         qr: qrCode,
         qr_base64: qrCodeBase64,
-        status: connectionStatus
+        status: connectionStatus,
+        reconnect_attempts: reconnectAttempts
     });
 });
 
@@ -323,6 +416,7 @@ app.get('/status', (req, res) => {
     res.json({
         status: connectionStatus,
         connected: connectionStatus === 'connected',
+        reconnect_attempts: reconnectAttempts,
         user: connectedUser ? {
             id: connectedUser.id,
             name: connectedUser.name
@@ -331,7 +425,12 @@ app.get('/status', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({ 
+        status: 'ok', 
+        timestamp: new Date().toISOString(),
+        wa_status: connectionStatus,
+        reconnect_attempts: reconnectAttempts
+    });
 });
 
 app.post('/send', async (req, res) => {
@@ -347,6 +446,7 @@ app.post('/send', async (req, res) => {
 
 app.post('/logout', async (req, res) => {
     try {
+        stopKeepAlive();
         if (sock) {
             await sock.logout();
         }
@@ -354,6 +454,7 @@ app.post('/logout', async (req, res) => {
         connectedUser = null;
         qrCode = null;
         qrCodeBase64 = null;
+        reconnectAttempts = 0;
         res.json({ success: true, message: 'Logged out successfully' });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -362,12 +463,47 @@ app.post('/logout', async (req, res) => {
 
 app.post('/reconnect', async (req, res) => {
     try {
+        stopKeepAlive();
         if (sock) {
             sock.end();
         }
         connectionStatus = 'reconnecting';
+        reconnectAttempts = 0; // Reset counter for manual reconnect
         await initWhatsApp();
         res.json({ success: true, message: 'Reconnecting...' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Reset auth endpoint - use when QR keeps regenerating
+app.post('/reset-auth', async (req, res) => {
+    try {
+        stopKeepAlive();
+        if (sock) {
+            sock.end();
+        }
+        
+        // Clear auth folder
+        const fs = require('fs');
+        const path = require('path');
+        const authPath = './auth_info';
+        
+        if (fs.existsSync(authPath)) {
+            fs.rmSync(authPath, { recursive: true, force: true });
+            logger.info('Auth folder cleared');
+        }
+        
+        connectionStatus = 'disconnected';
+        connectedUser = null;
+        qrCode = null;
+        qrCodeBase64 = null;
+        reconnectAttempts = 0;
+        
+        // Restart connection
+        setTimeout(initWhatsApp, 1000);
+        
+        res.json({ success: true, message: 'Auth reset. Please scan QR code again.' });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
