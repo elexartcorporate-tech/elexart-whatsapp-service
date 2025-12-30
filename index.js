@@ -32,9 +32,9 @@ const lidToPhoneMap = new Map();
 const contactsStore = new Map();
 const wsClients = new Set();
 
-const MAX_RECONNECT_ATTEMPTS = 15;
-const BASE_RECONNECT_DELAY = 3000;
-const KEEP_ALIVE_INTERVAL = 25000;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const BASE_RECONNECT_DELAY = 5000;
+const KEEP_ALIVE_INTERVAL = 45000; // Increased to 45s to reduce network pressure
 
 function broadcastStatus() {
     const data = JSON.stringify({
@@ -56,13 +56,14 @@ function startKeepAlive() {
         if (sock && connectionStatus === 'connected') {
             try {
                 await sock.sendPresenceUpdate('available');
-                logger.info('Keep-alive sent');
+                logger.info('Keep-alive sent (45s interval)');
             } catch (err) {
-                logger.warn('Keep-alive warning:', err.message);
+                // Don't trigger reconnect on keep-alive failure, just log it
+                logger.warn('Keep-alive warning (non-critical):', err.message);
             }
         }
     }, KEEP_ALIVE_INTERVAL);
-    logger.info('Keep-alive started (25s interval)');
+    logger.info('Keep-alive started (45s interval)');
 }
 
 function stopKeepAlive() {
@@ -90,9 +91,9 @@ async function initWhatsApp() {
             version,
             syncFullHistory: false,
             markOnlineOnConnect: true,
-            retryRequestDelayMs: 500,
-            connectTimeoutMs: 60000,
-            keepAliveIntervalMs: 25000,
+            retryRequestDelayMs: 1000,
+            connectTimeoutMs: 90000,
+            // REMOVED: keepAliveIntervalMs - using custom keep-alive instead to avoid conflict
             getMessage: async () => ({ conversation: '' })
         });
 
@@ -248,11 +249,32 @@ app.post('/logout', async (req, res) => {
 
 app.post('/reconnect', async (req, res) => {
     try {
+        // Only reconnect if truly disconnected, avoid reconnect loops
+        if (connectionStatus === 'connected') {
+            return res.json({ success: true, message: 'Already connected, skipping reconnect' });
+        }
+        
         stopKeepAlive();
         if (sock) sock.end();
         connectionStatus = 'reconnecting'; reconnectAttempts = 0;
         await initWhatsApp();
         res.json({ success: true, message: 'Reconnecting...' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Alias for backward compatibility with backend monitor
+app.post('/auto-reconnect', async (req, res) => {
+    // Only auto-reconnect if in error state, not during normal reconnection
+    if (connectionStatus === 'connected' || connectionStatus === 'reconnecting' || connectionStatus === 'waiting_scan') {
+        return res.json({ success: true, message: `Skipped auto-reconnect, current status: ${connectionStatus}` });
+    }
+    
+    try {
+        stopKeepAlive();
+        if (sock) sock.end();
+        connectionStatus = 'reconnecting'; reconnectAttempts = 0;
+        await initWhatsApp();
+        res.json({ success: true, message: 'Auto-reconnecting...' });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
