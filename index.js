@@ -1,6 +1,6 @@
 /**
  * WhatsApp Web Service for Elexart CRM
- * Version: 2.1.0 - Stable Connection
+ * Version: 2.2.0 - Anti-Sleep & Stable Connection
  */
 
 const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
@@ -19,6 +19,7 @@ app.use(express.json());
 const logger = pino({ level: 'info' });
 const FASTAPI_URL = process.env.FASTAPI_URL || 'https://social-crm-hub-2.preview.emergentagent.com';
 const PORT = process.env.PORT || 3002;
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
 let sock = null;
 let qrCode = null;
@@ -26,7 +27,9 @@ let qrCodeBase64 = null;
 let connectionStatus = 'disconnected';
 let connectedUser = null;
 let keepAliveInterval = null;
+let selfPingInterval = null;
 let reconnectAttempts = 0;
+let lastActivityTime = Date.now();
 
 const lidToPhoneMap = new Map();
 const contactsStore = new Map();
@@ -34,7 +37,8 @@ const wsClients = new Set();
 
 const MAX_RECONNECT_ATTEMPTS = 10;
 const BASE_RECONNECT_DELAY = 5000;
-const KEEP_ALIVE_INTERVAL = 45000; // Increased to 45s to reduce network pressure
+const KEEP_ALIVE_INTERVAL = 45000; // 45s for WhatsApp presence
+const SELF_PING_INTERVAL = 600000; // 10 minutes - self-ping to prevent Render.com sleep
 
 function broadcastStatus() {
     const data = JSON.stringify({
@@ -70,6 +74,31 @@ function stopKeepAlive() {
     if (keepAliveInterval) {
         clearInterval(keepAliveInterval);
         keepAliveInterval = null;
+    }
+}
+
+// Self-ping to prevent Render.com from sleeping the service
+function startSelfPing() {
+    if (selfPingInterval) clearInterval(selfPingInterval);
+    
+    selfPingInterval = setInterval(async () => {
+        try {
+            // Ping our own endpoint to keep the service awake
+            const response = await axios.get(`${SELF_URL}/ping`, { timeout: 10000 });
+            logger.info(`Self-ping: OK (uptime: ${Math.floor(process.uptime())}s, status: ${connectionStatus})`);
+            lastActivityTime = Date.now();
+        } catch (err) {
+            logger.warn(`Self-ping failed: ${err.message}`);
+        }
+    }, SELF_PING_INTERVAL);
+    
+    logger.info('Self-ping started (10 min interval) to prevent Render.com sleep');
+}
+
+function stopSelfPing() {
+    if (selfPingInterval) {
+        clearInterval(selfPingInterval);
+        selfPingInterval = null;
     }
 }
 
@@ -291,10 +320,29 @@ app.post('/reset-auth', async (req, res) => {
 
 app.get('/contacts', (req, res) => res.json({ contacts: Array.from(contactsStore.values()) }));
 
-const server = app.listen(PORT, () => { logger.info(`WhatsApp Service v2.1.0 on port ${PORT}`); initWhatsApp(); });
+// Uptime and diagnostics endpoint
+app.get('/diagnostics', (req, res) => res.json({
+    version: '2.2.0',
+    uptime: process.uptime(),
+    uptime_human: `${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() % 3600) / 60)}m`,
+    wa_status: connectionStatus,
+    connected_user: connectedUser ? connectedUser.name : null,
+    reconnect_attempts: reconnectAttempts,
+    last_activity: new Date(lastActivityTime).toISOString(),
+    memory: process.memoryUsage(),
+    self_url: SELF_URL
+}));
+
+const server = app.listen(PORT, () => { 
+    logger.info(`WhatsApp Service v2.2.0 on port ${PORT}`); 
+    initWhatsApp();
+    // Start self-ping after 1 minute to allow service to fully start
+    setTimeout(startSelfPing, 60000);
+});
 const wss = new WebSocket.Server({ server, path: '/ws' });
 wss.on('connection', (ws) => {
     wsClients.add(ws);
+    lastActivityTime = Date.now();
     ws.send(JSON.stringify({ type: 'status', status: connectionStatus, connected: connectionStatus === 'connected', user: connectedUser ? { id: connectedUser.id, name: connectedUser.name } : null }));
     ws.on('close', () => wsClients.delete(ws));
 });
