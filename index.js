@@ -4,6 +4,7 @@ const cors = require('cors');
 const axios = require('axios');
 const QRCode = require('qrcode');
 const pino = require('pino');
+const WebSocket = require('ws');
 
 const app = express();
 app.use(cors());
@@ -25,30 +26,89 @@ const lidToPhoneMap = new Map();
 // Store contacts from messages
 const contactsStore = new Map();
 
-// ========== KEEP-ALIVE MECHANISM ==========
+// ========== ENHANCED KEEP-ALIVE MECHANISM ==========
 let keepAliveInterval = null;
+let healthCheckInterval = null;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 10;
-const BASE_RECONNECT_DELAY = 5000; // 5 seconds
+const MAX_RECONNECT_ATTEMPTS = 15; // Increased from 10
+const BASE_RECONNECT_DELAY = 3000; // Reduced from 5000
+const KEEP_ALIVE_INTERVAL = 20000; // 20 seconds (was 30)
+const HEALTH_CHECK_INTERVAL = 60000; // 1 minute
+
+// WebSocket clients for real-time status
+const wsClients = new Set();
+
+function broadcastStatus() {
+    const statusData = JSON.stringify({
+        type: 'status',
+        status: connectionStatus,
+        connected: connectionStatus === 'connected',
+        reconnect_attempts: reconnectAttempts,
+        user: connectedUser ? {
+            id: connectedUser.id,
+            name: connectedUser.name
+        } : null,
+        timestamp: new Date().toISOString()
+    });
+    
+    wsClients.forEach(ws => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(statusData);
+        }
+    });
+}
 
 function startKeepAlive() {
-    // Clear any existing interval
-    if (keepAliveInterval) {
-        clearInterval(keepAliveInterval);
-    }
+    // Clear any existing intervals
+    stopKeepAlive();
     
-    // Send presence update every 30 seconds to keep connection alive
+    // Send presence update every 20 seconds to keep connection alive
     keepAliveInterval = setInterval(async () => {
         if (sock && connectionStatus === 'connected') {
             try {
                 // Send presence update to keep session alive
                 await sock.sendPresenceUpdate('available');
                 logger.info('Keep-alive: Presence update sent');
+                
+                // Also refresh connection state
+                if (sock.ws) {
+                    sock.ws.ping();
+                }
             } catch (err) {
-                logger.warn('Keep-alive: Failed to send presence update', err.message);
+                logger.warn('Keep-alive failed:', err.message);
+                
+                // If keep-alive fails, trigger reconnect
+                if (connectionStatus === 'connected') {
+                    logger.info('Keep-alive failed, triggering reconnect...');
+                    connectionStatus = 'reconnecting';
+                    broadcastStatus();
+                    initWhatsApp();
+                }
             }
         }
-    }, 30000); // Every 30 seconds
+    }, KEEP_ALIVE_INTERVAL);
+    
+    // Health check every 1 minute - verify connection is really alive
+    healthCheckInterval = setInterval(async () => {
+        if (sock && connectionStatus === 'connected') {
+            try {
+                // Check if socket is still alive
+                const isAlive = sock.ws && sock.ws.readyState === WebSocket.OPEN;
+                if (!isAlive) {
+                    logger.warn('WebSocket not alive, reconnecting...');
+                    connectionStatus = 'reconnecting';
+                    broadcastStatus();
+                    initWhatsApp();
+                } else {
+                    logger.info('Health check: Connection is alive');
+                }
+            } catch (err) {
+                logger.error('Health check error:', err.message);
+            }
+        }
+    }, HEALTH_CHECK_INTERVAL);
+    
+    logger.info('Keep-alive and health check started');
 }
 
 function stopKeepAlive() {
@@ -56,11 +116,16 @@ function stopKeepAlive() {
         clearInterval(keepAliveInterval);
         keepAliveInterval = null;
     }
+    if (healthCheckInterval) {
+        clearInterval(healthCheckInterval);
+        healthCheckInterval = null;
+    }
+    logger.info('Keep-alive stopped');
 }
 
 function getReconnectDelay() {
-    // Exponential backoff: 5s, 10s, 20s, 40s, ... up to max 5 minutes
-    const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts), 300000);
+    // Exponential backoff: 3s, 6s, 12s, 24s, ... up to max 2 minutes
+    const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts), 120000);
     return delay;
 }
 
@@ -95,6 +160,7 @@ async function initWhatsApp() {
                 try {
                     qrCodeBase64 = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
                     connectionStatus = 'waiting_scan';
+                    broadcastStatus();
                     logger.info('QR Code generated - waiting for scan');
                 } catch (err) {
                     logger.error('QR generation error:', err);
@@ -113,6 +179,7 @@ async function initWhatsApp() {
                 
                 // Stop keep-alive when disconnected
                 stopKeepAlive();
+                broadcastStatus();
                 
                 if (shouldReconnect) {
                     reconnectAttempts++;
@@ -121,10 +188,19 @@ async function initWhatsApp() {
                         const delay = getReconnectDelay();
                         logger.info(`Reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay/1000}s`);
                         connectionStatus = 'reconnecting';
+                        broadcastStatus();
                         setTimeout(initWhatsApp, delay);
                     } else {
                         logger.error('Max reconnect attempts reached. Manual intervention required.');
                         connectionStatus = 'error';
+                        broadcastStatus();
+                        
+                        // Auto-reset after 5 minutes if max attempts reached
+                        setTimeout(() => {
+                            logger.info('Auto-reset: Trying to reconnect after cooldown');
+                            reconnectAttempts = 0;
+                            initWhatsApp();
+                        }, 300000); // 5 minutes
                     }
                 }
             } else if (connection === 'open') {
@@ -139,6 +215,7 @@ async function initWhatsApp() {
                 
                 // Start keep-alive mechanism
                 startKeepAlive();
+                broadcastStatus();
                 
                 try {
                     await axios.post(`${FASTAPI_URL}/api/whatsapp-web/connected`, {
@@ -429,8 +506,30 @@ app.get('/health', (req, res) => {
         status: 'ok', 
         timestamp: new Date().toISOString(),
         wa_status: connectionStatus,
-        reconnect_attempts: reconnectAttempts
+        reconnect_attempts: reconnectAttempts,
+        uptime: process.uptime(),
+        keep_alive_active: keepAliveInterval !== null,
+        health_check_active: healthCheckInterval !== null
     });
+});
+
+// Enhanced ping endpoint to keep service warm
+app.get('/ping', (req, res) => {
+    res.json({ pong: true, timestamp: Date.now() });
+});
+
+// Auto-reconnect endpoint - triggered by external monitor
+app.post('/auto-reconnect', async (req, res) => {
+    if (connectionStatus === 'disconnected' || connectionStatus === 'error') {
+        logger.info('Auto-reconnect triggered by external service');
+        reconnectAttempts = 0;
+        connectionStatus = 'reconnecting';
+        broadcastStatus();
+        await initWhatsApp();
+        res.json({ success: true, message: 'Auto-reconnect initiated' });
+    } else {
+        res.json({ success: false, message: `Current status: ${connectionStatus}`, status: connectionStatus });
+    }
 });
 
 app.post('/send', async (req, res) => {
@@ -518,8 +617,61 @@ app.get('/contacts', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
+// WebSocket server for real-time status
+const server = app.listen(PORT, () => {
     logger.info(`WhatsApp Web Service running on port ${PORT}`);
     logger.info(`FastAPI backend URL: ${FASTAPI_URL}`);
     initWhatsApp();
 });
+
+// Create WebSocket server
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
+wss.on('connection', (ws) => {
+    logger.info('WebSocket client connected');
+    wsClients.add(ws);
+    
+    // Send current status immediately
+    ws.send(JSON.stringify({
+        type: 'status',
+        status: connectionStatus,
+        connected: connectionStatus === 'connected',
+        reconnect_attempts: reconnectAttempts,
+        user: connectedUser ? {
+            id: connectedUser.id,
+            name: connectedUser.name
+        } : null,
+        timestamp: new Date().toISOString()
+    }));
+    
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            if (data.type === 'ping') {
+                ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+            } else if (data.type === 'reconnect' && connectionStatus !== 'connected') {
+                logger.info('Reconnect requested via WebSocket');
+                reconnectAttempts = 0;
+                initWhatsApp();
+            }
+        } catch (err) {
+            logger.warn('Invalid WebSocket message:', err.message);
+        }
+    });
+    
+    ws.on('close', () => {
+        logger.info('WebSocket client disconnected');
+        wsClients.delete(ws);
+    });
+    
+    // Ping client every 30 seconds to keep connection alive
+    const pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.ping();
+        } else {
+            clearInterval(pingInterval);
+        }
+    }, 30000);
+});
+
+logger.info('WebSocket server ready on /ws');
