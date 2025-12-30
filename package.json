@@ -1,21 +1,18 @@
-{
-  "name": "elexart-whatsapp-service",
-  "version": "1.0.0",
-  "description": "WhatsApp Web Service for Elexart CRM with MongoDB session storage",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
+"{
+  \"name\": \"whatsapp-service\",
+  \"version\": \"2.1.0\",
+  \"main\": \"index.js\",
+  \"scripts\": {
+    \"start\": \"node index.js\"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc.9",
-    "axios": "^1.13.2",
-    "cors": "^2.8.5",
-    "express": "^5.2.1",
-    "mongodb": "^6.3.0",
-    "pino": "^10.1.0",
-    "qrcode": "^1.5.4"
+  \"dependencies\": {
+    \"@whiskeysockets/baileys\": \"^7.0.0-rc.9\",
+    \"axios\": \"^1.13.2\",
+    \"cors\": \"^2.8.5\",
+    \"express\": \"^5.2.1\",
+    \"pino\": \"^10.1.0\",
+    \"qrcode\": \"^1.5.4\",
+    \"ws\": \"^8.18.0\"
   }
 }
+"
