@@ -1,3 +1,8 @@
+"/**
+ * WhatsApp Web Service for Elexart CRM
+ * Version: 2.1.0 - Stable Connection
+ */
+
 const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const express = require('express');
 const cors = require('cors');
