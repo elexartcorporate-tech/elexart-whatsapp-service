@@ -1,3 +1,8 @@
+/**
+ * WhatsApp Web Service for Elexart CRM
+ * Version: 2.1.0 - Stable Connection
+ */
+
 const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const express = require('express');
 const cors = require('cors');
@@ -12,7 +17,7 @@ app.use(cors());
 app.use(express.json());
 
 const logger = pino({ level: 'info' });
-const FASTAPI_URL = process.env.FASTAPI_URL || 'https://inboxify-social.preview.emergentagent.com';
+const FASTAPI_URL = process.env.FASTAPI_URL || 'https://social-crm-hub-2.preview.emergentagent.com';
 const PORT = process.env.PORT || 3002;
 
 let sock = null;
@@ -271,4 +276,3 @@ wss.on('connection', (ws) => {
     ws.send(JSON.stringify({ type: 'status', status: connectionStatus, connected: connectionStatus === 'connected', user: connectedUser ? { id: connectedUser.id, name: connectedUser.name } : null }));
     ws.on('close', () => wsClients.delete(ws));
 });
-"
